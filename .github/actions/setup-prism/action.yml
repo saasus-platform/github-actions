@@ -48,8 +48,9 @@ runs:
 
         # pids currently LISTENing on a TCP port (own user's processes).
         listener_pids() {
+          # `|| true` so an empty result (grep exit 1) does not abort under set -e.
           ss -ltnpH "sport = :$1" 2>/dev/null \
-            | grep -oE 'pid=[0-9]+' | sed 's/pid=//' | sort -u
+            | grep -oE 'pid=[0-9]+' | sed 's/pid=//' | sort -u || true
         }
         # True if pid is the launched process or a direct child of it.
         owned_by_us() {
@@ -60,10 +61,29 @@ runs:
           [ "${pp}" = "${ours}" ]
         }
 
-        # Install Prism once (avoids re-resolving the package for every module).
+        # Install Prism once into a local prefix (avoids re-resolving the
+        # package for every module, and avoids relying on the global bin being
+        # on PATH inside this step). Retry to absorb transient registry errors.
         echo "Installing @stoplight/prism-cli@${PRISM_VERSION}"
-        npm install -g "@stoplight/prism-cli@${PRISM_VERSION}" >/dev/null 2>&1
-        prism_bin="$(command -v prism)"
+        prism_home="${tmp}/prism-cli"
+        mkdir -p "${prism_home}"
+        install_ok=""
+        for attempt in 1 2 3; do
+          if npm install --no-save --no-audit --no-fund \
+              --prefix "${prism_home}" "@stoplight/prism-cli@${PRISM_VERSION}" \
+              > "${tmp}/npm-install.log" 2>&1; then
+            install_ok=1
+            break
+          fi
+          echo "npm install attempt ${attempt} failed; retrying..." >&2
+          sleep 5
+        done
+        prism_bin="${prism_home}/node_modules/.bin/prism"
+        if [ -z "${install_ok}" ] || [ ! -x "${prism_bin}" ]; then
+          echo "failed to install @stoplight/prism-cli@${PRISM_VERSION} after 3 attempts" >&2
+          tail -n 20 "${tmp}/npm-install.log" >&2 || true
+          exit 1
+        fi
 
         # Pre-flight: every target port must be free before we launch anything.
         i=0

@@ -1,0 +1,137 @@
+name: Setup Prism mocks
+description: >-
+  Start one Prism mock server per module from the OpenAPI specs, in static mode
+  with --errors (schema validation returns HTTP errors). Each server listens on
+  127.0.0.1 on a sequential port. Prism's own logs are kept in files and never
+  printed, so response/spec bodies do not leak into the workflow log.
+
+inputs:
+  spec-dir:
+    description: "Directory containing <module>.yml files (output of fetch-openapi-spec)."
+    required: true
+  modules:
+    description: "Space-separated module list. Each gets its own port, assigned in this order."
+    required: false
+    default: "auth pricing billing awsmarketplace integration apilog communication"
+  base-port:
+    description: "First port. Module N listens on base-port + N (0-indexed)."
+    required: false
+    default: "4010"
+  prism-version:
+    description: "Pinned @stoplight/prism-cli version."
+    required: false
+    default: "5.8.1"
+
+outputs:
+  endpoints-file:
+    description: "Path to a file with one `MODULE=URL` line per started mock."
+    value: ${{ steps.start.outputs.endpoints-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Start Prism mocks
+      id: start
+      shell: bash
+      env:
+        SPEC_DIR: ${{ inputs.spec-dir }}
+        MODULES: ${{ inputs.modules }}
+        BASE_PORT: ${{ inputs.base-port }}
+        PRISM_VERSION: ${{ inputs.prism-version }}
+      run: |
+        set -euo pipefail
+        tmp="${RUNNER_TEMP:-/tmp}"
+        endpoints_file="${tmp}/prism-endpoints.env"
+        started="${tmp}/prism-started.tsv"
+        : > "${endpoints_file}"
+        : > "${started}"
+
+        # pids currently LISTENing on a TCP port (own user's processes).
+        listener_pids() {
+          ss -ltnpH "sport = :$1" 2>/dev/null \
+            | grep -oE 'pid=[0-9]+' | sed 's/pid=//' | sort -u
+        }
+        # True if pid is the launched process or a direct child of it.
+        owned_by_us() {
+          local lp="$1" ours="$2"
+          [ "${lp}" = "${ours}" ] && return 0
+          local pp
+          pp="$(ps -o ppid= -p "${lp}" 2>/dev/null | tr -d ' ')"
+          [ "${pp}" = "${ours}" ]
+        }
+
+        # Install Prism once (avoids re-resolving the package for every module).
+        echo "Installing @stoplight/prism-cli@${PRISM_VERSION}"
+        npm install -g "@stoplight/prism-cli@${PRISM_VERSION}" >/dev/null 2>&1
+        prism_bin="$(command -v prism)"
+
+        # Pre-flight: every target port must be free before we launch anything.
+        i=0
+        for m in ${MODULES}; do
+          port=$((BASE_PORT + i))
+          if [ -n "$(listener_pids "${port}")" ]; then
+            echo "port ${port} (module '${m}') is already in use before launch; aborting" >&2
+            exit 1
+          fi
+          i=$((i + 1))
+        done
+
+        i=0
+        for m in ${MODULES}; do
+          port=$((BASE_PORT + i))
+          spec="${SPEC_DIR}/${m}.yml"
+          if [ ! -f "${spec}" ]; then
+            echo "spec not found for module ${m}: ${spec}" >&2
+            exit 1
+          fi
+          log="${tmp}/prism-${m}.log"
+          # Static mode is the default; --errors turns schema violations into HTTP errors.
+          nohup "${prism_bin}" mock --errors -h 127.0.0.1 -p "${port}" "${spec}" \
+            > "${log}" 2>&1 &
+          pid=$!
+          url="http://127.0.0.1:${port}"
+          printf '%s\t%s\t%s\n' "${m}" "${port}" "${pid}" >> "${started}"
+          echo "${m}=${url}" >> "${endpoints_file}"
+          upper="$(echo "${m}" | tr '[:lower:]' '[:upper:]')"
+          echo "PRISM_URL_${upper}=${url}" >> "$GITHUB_ENV"
+          i=$((i + 1))
+        done
+
+        # Readiness: the launched process must (a) still be alive, (b) be the
+        # process actually LISTENing on its port, and (c) answer HTTP. This
+        # defeats the case where a different server answers while our Prism is
+        # still loading the spec (and will later exit on a bind conflict).
+        while IFS=$'\t' read -r m port pid; do
+          url="http://127.0.0.1:${port}"
+          ok=""
+          for _ in $(seq 1 90); do
+            if ! kill -0 "${pid}" 2>/dev/null; then
+              echo "Prism for module '${m}' exited before becoming ready on port ${port}" >&2
+              echo "(likely a spec load failure or a port conflict; diagnostic log retained in the runner temp dir and not uploaded)" >&2
+              exit 1
+            fi
+            lps="$(listener_pids "${port}")"
+            if [ -n "${lps}" ]; then
+              mine=""
+              for lp in ${lps}; do
+                if owned_by_us "${lp}" "${pid}"; then mine=1; fi
+              done
+              if [ -z "${mine}" ]; then
+                echo "port ${port} (module '${m}') is served by another process (pids: ${lps}), not the launched Prism (pid ${pid}); aborting" >&2
+                exit 1
+              fi
+              code="$(curl -s -o /dev/null -w '%{http_code}' "${url}" || true)"
+              if [ -n "${code}" ] && [ "${code}" != "000" ]; then ok=1; break; fi
+            fi
+            sleep 1
+          done
+          if [ -z "${ok}" ]; then
+            echo "Prism for module '${m}' did not become ready on port ${port} within the timeout" >&2
+            echo "(diagnostic log retained in the runner temp dir and not uploaded)" >&2
+            exit 1
+          fi
+          echo "prism ready: ${m} -> ${url} (pid ${pid})"
+        done < "${started}"
+
+        echo "PRISM_ENDPOINTS_FILE=${endpoints_file}" >> "$GITHUB_ENV"
+        echo "endpoints-file=${endpoints_file}" >> "$GITHUB_OUTPUT"

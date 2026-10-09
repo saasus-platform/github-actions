@@ -1,0 +1,66 @@
+name: Resolve latest stable tag
+description: >-
+  Resolve the latest stable (non-rc) git tag of a repository, matching
+  ^v[0-9]+\.[0-9]+\.[0-9]+$. Defaults to the calling repository. Works for
+  public repos without a token and for private repos when a token is supplied.
+  The token is never printed.
+
+inputs:
+  repository:
+    description: "Target repository in owner/repo form. Defaults to the current repository ($GITHUB_REPOSITORY)."
+    required: false
+    default: ""
+  token:
+    description: >-
+      Token with contents:read on the target repository. Required only for
+      private repositories. Passed via an auth header, never interpolated into
+      logs.
+    required: false
+    default: ""
+
+outputs:
+  tag:
+    description: "The resolved latest stable tag (e.g. v1.4.2)."
+    value: ${{ steps.resolve.outputs.tag }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve latest stable tag
+      id: resolve
+      shell: bash
+      env:
+        INPUT_REPOSITORY: ${{ inputs.repository }}
+        TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        REPOSITORY="${INPUT_REPOSITORY:-$GITHUB_REPOSITORY}"
+        if [ -z "${REPOSITORY}" ]; then
+          echo "No repository given and GITHUB_REPOSITORY is empty" >&2
+          exit 1
+        fi
+
+        # Mask the token defensively even though we never echo it.
+        if [ -n "${TOKEN}" ]; then
+          echo "::add-mask::${TOKEN}"
+          AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "${TOKEN}" | base64 | tr -d '\n')"
+          echo "::add-mask::${AUTH_HEADER}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="${AUTH_HEADER}"
+        fi
+
+        # List tags without cloning. Only tag names are read; no repo content.
+        tag="$(git ls-remote --tags --refs "https://github.com/${REPOSITORY}.git" \
+          | awk '{print $2}' \
+          | sed 's#refs/tags/##' \
+          | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+          | sort -V \
+          | tail -n1)"
+
+        if [ -z "${tag}" ]; then
+          echo "No stable (non-rc) tag found for ${REPOSITORY}" >&2
+          exit 1
+        fi
+        echo "Resolved latest stable tag for ${REPOSITORY}: ${tag}"
+        echo "tag=${tag}" >> "$GITHUB_OUTPUT"

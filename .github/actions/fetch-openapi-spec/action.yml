@@ -1,0 +1,99 @@
+name: Fetch OpenAPI spec
+description: >-
+  Download the SaaSus module OpenAPI specs from the (private) api repository.
+  The api repository is fixed. When ref is omitted, the latest stable (non-rc)
+  tag of the api repository is resolved automatically. Only the required module
+  files are fetched (no full clone), they are written to a workspace-local
+  directory, and neither the token nor the spec body is printed.
+
+inputs:
+  ref:
+    description: "Git ref (tag/branch/sha) of the api repo. Omit to use the latest stable (non-rc) tag."
+    required: false
+    default: ""
+  token:
+    description: "Token with contents:read on the api repository (GitHub App installation token)."
+    required: true
+  modules:
+    description: "Space-separated module list to fetch."
+    required: false
+    default: "auth pricing billing awsmarketplace integration apilog communication"
+  dest:
+    description: "Destination directory (relative to workspace) for the normalized <module>.yml files."
+    required: false
+    default: "openapi-spec"
+
+outputs:
+  spec-dir:
+    description: "Absolute path to the directory containing the <module>.yml files."
+    value: ${{ steps.fetch.outputs.spec-dir }}
+  ref:
+    description: "The api ref actually used (resolved tag when ref was omitted)."
+    value: ${{ steps.fetch.outputs.ref }}
+  modules:
+    description: "The space-separated module list that was fetched."
+    value: ${{ steps.fetch.outputs.modules }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch specs
+      id: fetch
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+        GH_TOKEN: ${{ inputs.token }}
+        MODULES: ${{ inputs.modules }}
+        DEST: ${{ inputs.dest }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::${GH_TOKEN}"
+
+        # The api repository is fixed.
+        API_REPOSITORY="Anti-Pattern-Inc/saasus-api"
+
+        # Resolve the latest stable (non-rc) tag when ref is omitted.
+        ref="${REF}"
+        if [ -z "${ref}" ]; then
+          AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
+          echo "::add-mask::${AUTH_HEADER}"
+          ref="$(GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' \
+            GIT_CONFIG_VALUE_0="${AUTH_HEADER}" \
+            git ls-remote --tags --refs "https://github.com/${API_REPOSITORY}.git" \
+            | awk '{print $2}' | sed 's#refs/tags/##' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          if [ -z "${ref}" ]; then
+            echo "No stable (non-rc) tag found for ${API_REPOSITORY}" >&2
+            exit 1
+          fi
+        fi
+        echo "Using api ref: ${ref}"
+
+        dest_abs="${GITHUB_WORKSPACE}/${DEST}"
+        mkdir -p "${dest_abs}"
+
+        # Map module -> source path inside the api repo.
+        # integration uses integration.yml; all others use <module>api.yml.
+        src_path() {
+          local m="$1"
+          if [ "${m}" = "integration" ]; then
+            echo "modules/v1/${m}/controller/${m}api/integration.yml"
+          else
+            echo "modules/v1/${m}/controller/${m}api/${m}api.yml"
+          fi
+        }
+
+        for m in ${MODULES}; do
+          path="$(src_path "${m}")"
+          gh api \
+            -H "Accept: application/vnd.github.raw" \
+            "repos/${API_REPOSITORY}/contents/${path}?ref=${ref}" \
+            > "${dest_abs}/${m}.yml"
+          # Report only size, never body.
+          echo "fetched ${m}.yml ($(wc -c < "${dest_abs}/${m}.yml") bytes)"
+        done
+
+        echo "spec-dir=${dest_abs}" >> "$GITHUB_OUTPUT"
+        echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+        echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"

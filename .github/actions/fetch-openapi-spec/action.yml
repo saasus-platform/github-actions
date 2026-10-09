@@ -53,15 +53,12 @@ runs:
         API_REPOSITORY="Anti-Pattern-Inc/saasus-api"
 
         # Resolve the latest stable (non-rc) tag when ref is omitted.
+        # Use the REST API (gh) rather than git, so we never add a second
+        # Authorization header on top of the one actions/checkout persists
+        # (which would make GitHub reject the request with HTTP 400).
         ref="${REF}"
         if [ -z "${ref}" ]; then
-          AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')"
-          echo "::add-mask::${AUTH_HEADER}"
-          ref="$(GIT_CONFIG_COUNT=1 \
-            GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' \
-            GIT_CONFIG_VALUE_0="${AUTH_HEADER}" \
-            git ls-remote --tags --refs "https://github.com/${API_REPOSITORY}.git" \
-            | awk '{print $2}' | sed 's#refs/tags/##' \
+          ref="$(gh api --paginate "repos/${API_REPOSITORY}/tags" --jq '.[].name' \
             | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
           if [ -z "${ref}" ]; then
             echo "No stable (non-rc) tag found for ${API_REPOSITORY}" >&2

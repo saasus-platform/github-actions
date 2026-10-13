@@ -53,15 +53,36 @@ runs:
         API_REPOSITORY="Anti-Pattern-Inc/saasus-api"
 
         # Resolve the latest stable (non-rc) tag when ref is omitted.
-        # Use the REST API (gh) rather than git, so we never add a second
-        # Authorization header on top of the one actions/checkout persists
-        # (which would make GitHub reject the request with HTTP 400).
+        # Select by most recent commit date, NOT by version sort: the api tags
+        # are not semver-monotonic (an old v10.x tag sorts above the current
+        # v1.x line), so `sort -V` would pick a stale definition. Use gh (REST
+        # API) rather than git to avoid a duplicate Authorization header on top
+        # of the one actions/checkout persists.
         ref="${REF}"
         if [ -z "${ref}" ]; then
-          ref="$(gh api --paginate "repos/${API_REPOSITORY}/tags" --jq '.[].name' \
-            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          owner="${API_REPOSITORY%/*}"
+          name="${API_REPOSITORY#*/}"
+          # Tags ordered by commit date (DESC): the newest is always on the
+          # first page, so the first matching non-rc tag is the latest. Retry a
+          # few times to absorb transient API errors; never fall back to a
+          # version sort (which would pick a stale tag).
+          ref=""
+          for attempt in 1 2 3; do
+            nodes="$(gh api graphql -f owner="${owner}" -f name="${name}" -f query='
+              query($owner:String!,$name:String!){
+                repository(owner:$owner,name:$name){
+                  refs(refPrefix:"refs/tags/",first:100,orderBy:{field:TAG_COMMIT_DATE,direction:DESC}){
+                    nodes{ name }
+                  }
+                }
+              }' --jq '.data.repository.refs.nodes[].name' 2>/dev/null || true)"
+            ref="$(printf '%s\n' "${nodes}" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+            [ -n "${ref}" ] && break
+            echo "tag resolution attempt ${attempt} failed; retrying..." >&2
+            sleep 3
+          done
           if [ -z "${ref}" ]; then
-            echo "No stable (non-rc) tag found for ${API_REPOSITORY}" >&2
+            echo "failed to resolve the latest stable (non-rc) tag for ${API_REPOSITORY}" >&2
             exit 1
           fi
         fi

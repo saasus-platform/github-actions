@@ -1,9 +1,11 @@
 name: Setup Prism mocks
 description: >-
-  Start one Prism mock server per module from the OpenAPI specs, in static mode
-  with --errors (schema validation returns HTTP errors). Each server listens on
-  127.0.0.1 on a sequential port. Prism's own logs are kept in files and never
-  printed, so response/spec bodies do not leak into the workflow log.
+  Start one Prism mock server per module from the OpenAPI specs, with --errors
+  (schema validation returns HTTP errors). By default this is static mode;
+  set `dynamic: true` to use dynamic mode (-d), which generates schema-valid
+  responses instead of echoing spec examples. Each server listens on 127.0.0.1
+  on a sequential port. Prism's own logs are kept in files and never printed,
+  so response/spec bodies do not leak into the workflow log.
 
 inputs:
   spec-dir:
@@ -17,6 +19,10 @@ inputs:
     description: "First port. Module N listens on base-port + N (0-indexed)."
     required: false
     default: "4010"
+  dynamic:
+    description: "Use Prism dynamic mode (-d) so responses are generated to match the schema."
+    required: false
+    default: "false"
   prism-version:
     description: "Pinned @stoplight/prism-cli version."
     required: false
@@ -37,6 +43,7 @@ runs:
         SPEC_DIR: ${{ inputs.spec-dir }}
         MODULES: ${{ inputs.modules }}
         BASE_PORT: ${{ inputs.base-port }}
+        DYNAMIC: ${{ inputs.dynamic }}
         PRISM_VERSION: ${{ inputs.prism-version }}
       run: |
         set -euo pipefail
@@ -85,6 +92,13 @@ runs:
           exit 1
         fi
 
+        # Optional dynamic mode: generate schema-valid responses instead of
+        # echoing spec examples. Static mode is the default.
+        dyn=""
+        if [ "${DYNAMIC}" = "true" ]; then
+          dyn="-d"
+        fi
+
         # Pre-flight: every target port must be free before we launch anything.
         i=0
         for m in ${MODULES}; do
@@ -106,7 +120,7 @@ runs:
           fi
           log="${tmp}/prism-${m}.log"
           # Static mode is the default; --errors turns schema violations into HTTP errors.
-          nohup "${prism_bin}" mock --errors -h 127.0.0.1 -p "${port}" "${spec}" \
+          nohup "${prism_bin}" mock --errors ${dyn} -h 127.0.0.1 -p "${port}" "${spec}" \
             > "${log}" 2>&1 &
           pid=$!
           url="http://127.0.0.1:${port}"

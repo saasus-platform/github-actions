@@ -17,15 +17,6 @@ inputs:
     description: "First port. Module N listens on base-port + N (0-indexed)."
     required: false
     default: "4010"
-  prism-version:
-    description: "Pinned @stoplight/prism-cli version."
-    required: false
-    default: "5.8.1"
-
-outputs:
-  endpoints-file:
-    description: "Path to a file with one `MODULE=URL` line per started mock."
-    value: ${{ steps.start.outputs.endpoints-file }}
 
 runs:
   using: composite
@@ -37,13 +28,14 @@ runs:
         SPEC_DIR: ${{ inputs.spec-dir }}
         MODULES: ${{ inputs.modules }}
         BASE_PORT: ${{ inputs.base-port }}
-        PRISM_VERSION: ${{ inputs.prism-version }}
       run: |
         set -euo pipefail
+        # Pinned @stoplight/prism-cli version. Kept as a single constant here
+        # (not an action input): the version is part of this shared base and is
+        # maintained in one place, so callers neither pass nor override it.
+        PRISM_VERSION="5.8.1"
         tmp="${RUNNER_TEMP:-/tmp}"
-        endpoints_file="${tmp}/prism-endpoints.env"
         started="${tmp}/prism-started.tsv"
-        : > "${endpoints_file}"
         : > "${started}"
 
         # pids currently LISTENing on a TCP port (own user's processes).
@@ -111,7 +103,6 @@ runs:
           pid=$!
           url="http://127.0.0.1:${port}"
           printf '%s\t%s\t%s\n' "${m}" "${port}" "${pid}" >> "${started}"
-          echo "${m}=${url}" >> "${endpoints_file}"
           upper="$(echo "${m}" | tr '[:lower:]' '[:upper:]')"
           echo "PRISM_URL_${upper}=${url}" >> "$GITHUB_ENV"
           i=$((i + 1))
@@ -152,6 +143,3 @@ runs:
           fi
           echo "prism ready: ${m} -> ${url} (pid ${pid})"
         done < "${started}"
-
-        echo "PRISM_ENDPOINTS_FILE=${endpoints_file}" >> "$GITHUB_ENV"
-        echo "endpoints-file=${endpoints_file}" >> "$GITHUB_OUTPUT"

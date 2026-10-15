@@ -25,12 +25,11 @@ SDK 自動テスト（契約テスト）の共通CI基盤。保守は1か所（�
 ## コンポジットアクション 入力/出力インターフェース
 
 ### `resolve-latest-stable-tag`
-対象リポジトリの最新の安定版（非rc）タグ `^v[0-9]+\.[0-9]+\.[0-9]+$` を解決します。
+対象リポジトリの最新の安定版（非rc）タグ `^v[0-9]+\.[0-9]+\.[0-9]+$` を解決します。認証なしの `git ls-remote` でタグ名のみ参照するため、対象は**公開リポジトリ**に限ります。
 
 | 入力 | 必須 | 既定 | 説明 |
 |---|---|---|---|
 | `repository` |  | 呼び出し元リポジトリ | `owner/repo` 形式。省略時は `$GITHUB_REPOSITORY`（自リポジトリ） |
-| `token` |  | `""` | private リポジトリ参照時のみ必要（contents:read）。ログには出力しない |
 
 | 出力 | 説明 |
 |---|---|
@@ -67,15 +66,9 @@ Prism 自身のログはファイルへリダイレクトし、**成功・失敗
 | `spec-dir` | ✓ | — | `fetch-openapi-spec` の出力ディレクトリ |
 | `modules` |  | 7モジュール | 起動順＝ポート割当順。`fetch-openapi-spec` の `modules` 出力を渡すと一覧の重複定義を避けられる |
 | `base-port` |  | `4010` | N番目のモジュールは `base-port + N`（0始まり） |
-| `prism-version` |  | `5.8.1` | 固定する `@stoplight/prism-cli` のバージョン |
 
-| 出力 | 説明 |
-|---|---|
-| `endpoints-file` | `MODULE=URL` 形式の行を持つファイルのパス |
-
-さらに次を job 環境へエクスポートします:
+次を job 環境へエクスポートします:
 - `PRISM_URL_<MODULE>`（例 `PRISM_URL_AUTH=http://127.0.0.1:4010`）
-- `PRISM_ENDPOINTS_FILE`（上記ファイルのパス）
 
 > SDK の baseURL は spec の `servers` のパス（例 `/v1/auth`）を含めず、各 Prism のルート
 > （`http://127.0.0.1:<port>`）に設定してください。Prism は `paths:` をルート直下で配信します。

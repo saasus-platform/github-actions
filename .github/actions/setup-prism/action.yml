@@ -1,0 +1,120 @@
+name: Setup Prism mocks
+description: >-
+  Start one Prism mock server per module from the OpenAPI specs, in static mode
+  with --errors (schema violations return HTTP errors). Each server listens on
+  127.0.0.1 on a sequential port from 4010, and its URL is exported to the job
+  environment as PRISM_URL_<MODULE>.
+
+inputs:
+  spec-dir:
+    description: "Directory containing <module>.yml files (output of fetch-openapi-spec)."
+    required: true
+  modules:
+    description: >-
+      Space-separated module list; pass the fetch-openapi-spec `modules` output
+      so the list is defined in one place. Each gets its own port, assigned in
+      this order.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Start Prism mocks
+      shell: bash
+      env:
+        SPEC_DIR: ${{ inputs.spec-dir }}
+        MODULES: ${{ inputs.modules }}
+      run: |
+        set -euo pipefail
+        # Pinned here rather than exposed as an input: the version is part of
+        # this shared base and is maintained in one place.
+        PRISM_VERSION="5.8.1"
+        BASE_PORT=4010
+        tmp="${RUNNER_TEMP:-/tmp}"
+        started="${tmp}/prism-started.tsv"
+        : > "${started}"
+
+        # `grep -q .` so an empty result is reported as "free" rather than
+        # aborting under set -e.
+        port_in_use() {
+          ss -ltnH "sport = :$1" 2>/dev/null | grep -q .
+        }
+
+        # Install once into a local prefix: avoids re-resolving the package per
+        # module and relying on the global bin being on PATH. Retry to absorb
+        # transient registry errors.
+        echo "Installing @stoplight/prism-cli@${PRISM_VERSION}"
+        prism_home="${tmp}/prism-cli"
+        mkdir -p "${prism_home}"
+        install_ok=""
+        for attempt in 1 2 3; do
+          if npm install --no-save --no-audit --no-fund \
+              --prefix "${prism_home}" "@stoplight/prism-cli@${PRISM_VERSION}" \
+              > "${tmp}/npm-install.log" 2>&1; then
+            install_ok=1
+            break
+          fi
+          echo "npm install attempt ${attempt} failed; retrying..." >&2
+          sleep 5
+        done
+        prism_bin="${prism_home}/node_modules/.bin/prism"
+        if [ -z "${install_ok}" ] || [ ! -x "${prism_bin}" ]; then
+          echo "failed to install @stoplight/prism-cli@${PRISM_VERSION} after 3 attempts" >&2
+          tail -n 20 "${tmp}/npm-install.log" >&2 || true
+          exit 1
+        fi
+
+        # Pre-flight, so an occupied port is reported as such instead of as an
+        # unexplained Prism exit on bind.
+        i=0
+        for m in ${MODULES}; do
+          port=$((BASE_PORT + i))
+          if port_in_use "${port}"; then
+            echo "port ${port} (module '${m}') is already in use before launch; aborting" >&2
+            exit 1
+          fi
+          i=$((i + 1))
+        done
+
+        i=0
+        for m in ${MODULES}; do
+          port=$((BASE_PORT + i))
+          spec="${SPEC_DIR}/${m}.yml"
+          if [ ! -f "${spec}" ]; then
+            echo "spec not found for module ${m}: ${spec}" >&2
+            exit 1
+          fi
+          log="${tmp}/prism-${m}.log"
+          # Static mode is the default; --errors turns schema violations into HTTP errors.
+          nohup "${prism_bin}" mock --errors -h 127.0.0.1 -p "${port}" "${spec}" \
+            > "${log}" 2>&1 &
+          pid=$!
+          url="http://127.0.0.1:${port}"
+          printf '%s\t%s\t%s\n' "${m}" "${port}" "${pid}" >> "${started}"
+          upper="$(echo "${m}" | tr '[:lower:]' '[:upper:]')"
+          echo "PRISM_URL_${upper}=${url}" >> "$GITHUB_ENV"
+          i=$((i + 1))
+        done
+
+        # Readiness: the launched process must still be alive and answer HTTP.
+        # A spec load failure makes Prism exit, which kill -0 catches.
+        while IFS=$'\t' read -r m port pid; do
+          url="http://127.0.0.1:${port}"
+          ok=""
+          for _ in $(seq 1 90); do
+            if ! kill -0 "${pid}" 2>/dev/null; then
+              echo "Prism for module '${m}' exited before becoming ready on port ${port}" >&2
+              echo "(likely a spec load failure; diagnostic log retained in the runner temp dir and not uploaded)" >&2
+              exit 1
+            fi
+            code="$(curl -s -o /dev/null -w '%{http_code}' "${url}" || true)"
+            if [ -n "${code}" ] && [ "${code}" != "000" ]; then ok=1; break; fi
+            sleep 1
+          done
+          if [ -z "${ok}" ]; then
+            echo "Prism for module '${m}' did not become ready on port ${port} within the timeout" >&2
+            echo "(diagnostic log retained in the runner temp dir and not uploaded)" >&2
+            exit 1
+          fi
+          echo "prism ready: ${m} -> ${url} (pid ${pid})"
+        done < "${started}"

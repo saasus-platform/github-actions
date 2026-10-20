@@ -1,0 +1,101 @@
+name: Fetch OpenAPI spec
+description: >-
+  Download the SaaSus module OpenAPI specs from the private api repository
+  (fixed to Anti-Pattern-Inc/saasus-api) into a workspace-local directory.
+  When ref is omitted, the api repository's latest stable (non-rc) tag is
+  resolved automatically.
+
+inputs:
+  ref:
+    description: "Git ref (tag/branch/sha) of the api repo. Omit to use the latest stable (non-rc) tag."
+    required: false
+    default: ""
+  token:
+    description: "Token with contents:read on the api repository (GitHub App installation token)."
+    required: true
+  modules:
+    description: "Space-separated module list to fetch."
+    required: false
+    default: "auth pricing billing awsmarketplace integration apilog communication"
+
+outputs:
+  spec-dir:
+    description: "Absolute path to the directory containing the <module>.yml files."
+    value: ${{ steps.fetch.outputs.spec-dir }}
+  modules:
+    description: "The space-separated module list that was fetched."
+    value: ${{ steps.fetch.outputs.modules }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch specs
+      id: fetch
+      shell: bash
+      env:
+        REF: ${{ inputs.ref }}
+        GH_TOKEN: ${{ inputs.token }}
+        MODULES: ${{ inputs.modules }}
+      run: |
+        set -euo pipefail
+        echo "::add-mask::${GH_TOKEN}"
+
+        API_REPOSITORY="Anti-Pattern-Inc/saasus-api"
+        DEST="openapi-spec"
+
+        # When ref is omitted: latest stable (non-rc) tag, ordered by commit
+        # date, NOT by version sort: the api tags are not semver-monotonic (an
+        # old v10.x tag sorts above the current v1.x line), so `sort -V` would
+        # pick a stale definition. gh graphql rather than git avoids a second
+        # Authorization header on top of the one actions/checkout persists.
+        # Retry to absorb transient API errors.
+        ref="${REF}"
+        if [ -z "${ref}" ]; then
+          owner="${API_REPOSITORY%/*}"
+          name="${API_REPOSITORY#*/}"
+          for attempt in 1 2 3; do
+            nodes="$(gh api graphql -f owner="${owner}" -f name="${name}" -f query='
+              query($owner:String!,$name:String!){
+                repository(owner:$owner,name:$name){
+                  refs(refPrefix:"refs/tags/",first:100,orderBy:{field:TAG_COMMIT_DATE,direction:DESC}){
+                    nodes{ name }
+                  }
+                }
+              }' --jq '.data.repository.refs.nodes[].name' 2>/dev/null || true)"
+            ref="$(printf '%s\n' "${nodes}" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+            [ -n "${ref}" ] && break
+            echo "tag resolution attempt ${attempt} failed; retrying..." >&2
+            sleep 3
+          done
+          if [ -z "${ref}" ]; then
+            echo "failed to resolve the latest stable (non-rc) tag for ${API_REPOSITORY}" >&2
+            exit 1
+          fi
+        fi
+        echo "Using api ref: ${ref}"
+
+        dest_abs="${GITHUB_WORKSPACE}/${DEST}"
+        mkdir -p "${dest_abs}"
+
+        # Map module -> source path inside the api repo.
+        src_path() {
+          local m="$1"
+          if [ "${m}" = "integration" ]; then
+            echo "modules/v1/${m}/controller/${m}api/integration.yml"
+          else
+            echo "modules/v1/${m}/controller/${m}api/${m}api.yml"
+          fi
+        }
+
+        for m in ${MODULES}; do
+          path="$(src_path "${m}")"
+          gh api \
+            -H "Accept: application/vnd.github.raw" \
+            "repos/${API_REPOSITORY}/contents/${path}?ref=${ref}" \
+            > "${dest_abs}/${m}.yml"
+          # Size only; never the body.
+          echo "fetched ${m}.yml ($(wc -c < "${dest_abs}/${m}.yml") bytes)"
+        done
+
+        echo "spec-dir=${dest_abs}" >> "$GITHUB_OUTPUT"
+        echo "modules=${MODULES}" >> "$GITHUB_OUTPUT"
